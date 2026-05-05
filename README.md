@@ -24,10 +24,13 @@ gpu-orchestrator/
 │   │   └── model_cache.go
 │   └── traffic/
 │       └── traffic_analyzer.go
-└── agent/              ← Rust
+└── agent/              ← Rust + Python loader
     ├── Cargo.toml
-    └── src/
-        └── main.rs
+    ├── src/
+    │   └── main.rs
+    └── loader/
+        ├── main.py
+        └── checkpoint.py
 ```
 
 ## Design Decisions
@@ -93,12 +96,25 @@ cd agent
 cargo run --features mock
 ```
 
-### 4) (Optional) Start the Python FastAPI model loader
+### 4) Start the Python FastAPI model loader
 
 ```bash
-# example only: adjust path when python service is added
-cd python-loader
-uvicorn app:app --host 127.0.0.1 --port 8001 --reload
+cd agent/loader
+python3 main.py serve --port 8001
+```
+
+### 5) Run tests
+
+```bash
+cd scheduler
+go test ./...
+```
+
+Run suites independently:
+
+```bash
+cd scheduler
+go test ./tests/unit ./tests/integration ./tests/system
 ```
 
 ## Development Notes
