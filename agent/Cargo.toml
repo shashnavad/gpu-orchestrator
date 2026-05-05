@@ -1,0 +1,25 @@
+[package]
+name = "gpu-agent"
+version = "0.1.0"
+edition = "2021"
+
+# The `mock` feature enables conditional compilation so the agent returns
+# synthetic telemetry instead of calling the NVIDIA driver.
+# Local development: `cargo run --features mock`
+# Production:        `cargo run`  (no feature flag → real nvidia-smi)
+[features]
+default = []
+mock = []
+
+[dependencies]
+# HTTP server for the Go scheduler to send commands to.
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# For the real nvidia-smi path: parse stdout from the nvidia-smi command.
+# No crate needed — we use std::process::Command.
+
+# Randomness for mock VRAM simulation.
+rand = "0.8"
