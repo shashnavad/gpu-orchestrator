@@ -10,7 +10,6 @@ Thumbs.db
 # 2. Go (Golang)
 # ==========================================
 # Binaries and templates
-/scheduler/scheduler
 /scheduler/scheduler-bin
 *.exe
 *.exe~
