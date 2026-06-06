@@ -1,0 +1,15 @@
+FROM golang:1.25-alpine AS builder
+# CHANGED: Changing /app to /build completely breaks Docker's old cache
+WORKDIR /build
+COPY go.mod .
+RUN go mod download
+COPY . .
+# Compile the static binary explicitly
+RUN CGO_ENABLED=0 go build -o scheduler-bin .
+
+FROM debian:bookworm-slim
+WORKDIR /app
+# Explicitly copy our uniquely named static binary
+COPY --from=builder /build/scheduler-bin ./scheduler
+EXPOSE 8080
+CMD ["./scheduler"]

@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"gpu-orchestrator/cache"
@@ -18,57 +22,107 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// --- Wire up core components ---
-
-	// NodeRegistry: single source of truth for cluster state.
-	// All components read from this; only the Reconciler writes to it.
 	nodeReg := registry.NewNodeRegistry()
-
-	// ModelCache: tracks which nodes have weight files on their NVMe.
 	modelCache := cache.NewModelCache()
-	_ = modelCache // used by the scheduler; wired below
-
-	// BinPacker: the placement engine.
+	_ = modelCache
 	bpScheduler := schedulerpkg.NewBinPacker(nodeReg)
-	_ = bpScheduler // in a full implementation, exposed via HTTP handler
+	_ = bpScheduler
 
-	// Channels — these are the nervous system connecting components.
-	// Buffered so producers don't block on a slow consumer.
 	heartbeatCh := make(chan reconciler.HeartbeatMsg, 256)
 	actionCh := make(chan reconciler.ReconcileAction, 64)
 	requestEventCh := make(chan traffic.RequestEvent, 1024)
 	prewarmSignalCh := make(chan traffic.PrewarmSignal, 64)
 
-	// Reconciler: anti-entropy loop, 500ms tick.
 	rec := reconciler.NewReconciler(nodeReg, heartbeatCh, actionCh)
-
-	// TrafficAnalyzer: rolling 5-minute window, emits PREWARM signals.
 	analyzer := traffic.NewTrafficAnalyzer(requestEventCh, prewarmSignalCh)
-
-	// --- Start goroutines ---
 
 	go rec.Run(ctx)
 	go analyzer.Run(ctx)
-
-	// Action handler: consumes ReconcileActions and PrewarmSignals.
-	// In a real deployment this would call the Rust agent's HTTP API.
 	go handleActions(ctx, actionCh, prewarmSignalCh)
+	go serveHeartbeats(ctx, heartbeatCh)
 
-	// Heartbeat ingestion stub: in production, this comes from the HTTP server
-	// where Rust agents POST their telemetry. Here we show the wiring.
-	go ingestHeartbeats(ctx, heartbeatCh)
-
-	log.Println("[main] gpu-orchestrator scheduler running")
+	log.Println("[main] gpu-orchestrator scheduler running on :8080")
 	<-ctx.Done()
 	log.Println("[main] shutdown complete")
 }
 
-// handleActions is the executor layer. It reads from both the Reconciler's
-// action channel and the TrafficAnalyzer's prewarm channel and dispatches
-// commands to the appropriate Rust agent.
-//
-// In production: each action results in an HTTP POST to the Rust agent
-// running as a sidecar on the target node.
+func serveHeartbeats(ctx context.Context, ch chan<- reconciler.HeartbeatMsg) {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var msg reconciler.HeartbeatMsg
+		if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		logHeartbeat(msg)
+		select {
+		case ch <- msg:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "heartbeat channel full", http.StatusServiceUnavailable)
+		}
+	})
+
+	srv := &http.Server{Addr: ":8080", Handler: mux}
+
+	go func() {
+		<-ctx.Done()
+		if err := srv.Shutdown(context.Background()); err != nil {
+			log.Printf("[heartbeat] shutdown error: %v", err)
+		}
+	}()
+
+	log.Println("[heartbeat] listening on :8080")
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("[heartbeat] fatal: %v", err)
+	}
+}
+
+// logHeartbeat prints a concise, human-readable summary of each incoming
+// heartbeat. For MIG nodes it prints per-slice VRAM; for non-MIG nodes it
+// prints node-level VRAM. Loaded models are shown inline so GPU allocation
+// state is visible at a glance without reading raw JSON.
+func logHeartbeat(msg reconciler.HeartbeatMsg) {
+	if msg.MIGEnabled && len(msg.MIGSlices) > 0 {
+		for _, s := range msg.MIGSlices {
+			usedPct := 0.0
+			if s.TotalVRAMMiB > 0 {
+				usedPct = float64(s.UsedVRAMMiB) / float64(s.TotalVRAMMiB) * 100
+			}
+			models := "idle"
+			if len(s.LoadedModels) > 0 {
+				models = strings.Join(s.LoadedModels, ", ")
+			}
+			log.Printf(
+				"[gpu] %s/%s slice=%-7s  allotted=%5d MiB  used=%5d MiB  free=%5d MiB  (%.0f%%)  models: %s",
+				msg.NodeID, msg.GPUID, s.SliceID,
+				s.TotalVRAMMiB, s.UsedVRAMMiB, s.TotalVRAMMiB-s.UsedVRAMMiB,
+				usedPct, models,
+			)
+		}
+	} else {
+		usedPct := 0.0
+		if msg.TotalVRAMMiB > 0 {
+			usedPct = float64(msg.UsedVRAMMiB) / float64(msg.TotalVRAMMiB) * 100
+		}
+		models := "idle"
+		if len(msg.LoadedModels) > 0 {
+			models = strings.Join(msg.LoadedModels, ", ")
+		}
+		log.Printf(
+			"[gpu] %s/%s  allotted=%5d MiB  used=%5d MiB  free=%5d MiB  (%.0f%%)  models: %s",
+			msg.NodeID, msg.GPUID,
+			msg.TotalVRAMMiB, msg.UsedVRAMMiB, msg.TotalVRAMMiB-msg.UsedVRAMMiB,
+			usedPct, models,
+		)
+	}
+}
+
 func handleActions(ctx context.Context, actions <-chan reconciler.ReconcileAction, prewarns <-chan traffic.PrewarmSignal) {
 	for {
 		select {
@@ -78,47 +132,29 @@ func handleActions(ctx context.Context, actions <-chan reconciler.ReconcileActio
 			}
 			switch action.Type {
 			case reconciler.ActionEvict:
-				log.Printf("[action] EVICT model=%s node=%s gpu=%s", action.ModelName, action.NodeID, action.GPUID)
-				// TODO: POST /evict to Rust agent at node's IP
+				log.Println(formatAction("EVICT", action))
 			case reconciler.ActionPrewarm:
-				log.Printf("[action] PREWARM model=%s node=%s gpu=%s", action.ModelName, action.NodeID, action.GPUID)
-				// TODO: POST /prewarm to Rust agent at node's IP
+				log.Println(formatAction("PLACED", action))
 			case reconciler.ActionMarkDead:
-				log.Printf("[action] MARK_DEAD node=%s gpu=%s — triggering rescheduling", action.NodeID, action.GPUID)
-				// TODO: trigger scheduler to migrate workloads from this node
+				log.Printf("[scheduler] NODE DOWN  %s/%s  -- workloads will be rescheduled", action.NodeID, action.GPUID)
 			}
-
 		case sig, ok := <-prewarns:
 			if !ok {
 				return
 			}
-			log.Printf("[action] PREWARM (traffic-driven) model=%s reason=%s", sig.ModelName, sig.Reason)
-			// TODO: select best node via cache.WarmNodes() and POST /prewarm
-
+			log.Printf("[scheduler] PREWARM  model=%-30s  reason: %s", sig.ModelName, sig.Reason)
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-// ingestHeartbeats is a placeholder for the HTTP handler that receives
-// heartbeats from Rust agents. In production this is an http.HandleFunc.
-// Here it simulates a single mock heartbeat to verify channel wiring.
-func ingestHeartbeats(ctx context.Context, ch chan<- reconciler.HeartbeatMsg) {
-	// Simulate one heartbeat from a mock Rust agent at startup.
-	select {
-	case ch <- reconciler.HeartbeatMsg{
-		NodeID:       "node-001",
-		GPUID:        "gpu-0",
-		TotalVRAMMiB: 81920, // H100 80GB
-		UsedVRAMMiB:  20480,
-		LoadedModels: []string{"llama-3-8b"},
-		ModelWeightAffinity: map[string]int64{
-			"llama-3-8b":  8192,
-			"phi-3-mini":  3800,
-		},
-	}:
-		log.Println("[ingest] sent mock heartbeat for node-001/gpu-0")
-	case <-ctx.Done():
+// formatAction builds a readable log line for placement and eviction events.
+// SliceID is omitted for non-MIG nodes to keep non-MIG output uncluttered.
+func formatAction(verb string, action reconciler.ReconcileAction) string {
+	location := fmt.Sprintf("%s/%s", action.NodeID, action.GPUID)
+	if action.SliceID != "" {
+		location = fmt.Sprintf("%s/%s slice=%s", action.NodeID, action.GPUID, action.SliceID)
 	}
+	return fmt.Sprintf("[scheduler] %-6s  model=%-30s  on %s", verb, action.ModelName, location)
 }

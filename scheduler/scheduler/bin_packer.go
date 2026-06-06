@@ -16,29 +16,45 @@ const (
 	P2BatchTrain  = 2 // Spot/idle only
 )
 
-// VRAMEvictionThresholdPct triggers spread-mode when any GPU exceeds this.
+// VRAMEvictionThresholdPct triggers spread-mode when any GPU or slice exceeds this.
 const VRAMEvictionThresholdPct = 85.0
 
-// ScheduleRequest is a request to place a model workload on a GPU.
+// ScheduleRequest is a request to place a model workload on a GPU or MIG slice.
 type ScheduleRequest struct {
-	ModelName    string
+	ModelName     string
 	VRAMNeededMiB int64
-	Priority     int
+	Priority      int
 }
 
 // ScheduleDecision is the output of the scheduler.
+// SliceID is non-empty only when the target node is MIG-enabled;
+// the Rust agent uses it to send the nvidia-smi MIG placement command.
 type ScheduleDecision struct {
 	NodeID      string
 	GPUID       string
+	SliceID     string // "" for non-MIG nodes; e.g. "0/0/0" for MIG slices
+	MIGEnabled  bool
 	AffinityHit bool // true if the model weights were already cached on this node
+}
+
+// placementCandidate is an internal structure that pairs a node with the
+// specific slice (or synthetic full-GPU slice) chosen for this request.
+// Using a unified candidate struct means the sorting and selection logic
+// does not branch on MIG vs non-MIG — it always operates on slices.
+type placementCandidate struct {
+	node    *registry.GPUNode
+	slice   registry.MIGSlice // always populated (synthetic for non-MIG nodes)
+	affHit  bool
 }
 
 // BinPacker is a centralized scheduler that applies bin-packing by default and
 // switches to spread mode when VRAM utilization exceeds VRAMEvictionThresholdPct.
 //
-// Design decision: centralized paradigm is correct for clusters < 1,000 GPUs.
-// A single process with a read lock on NodeRegistry gives us global optimum
-// placement without the race conditions of a shared-state approach.
+// MIG awareness: when a node reports MIGEnabled=true and has populated MIGSlices,
+// the scheduler picks the best individual slice rather than treating the whole
+// GPU as a monolith. This is the key change for multi-tenant fractionalization:
+// a single H100 can run llama-3-70b on a 4g.40gb slice while phi-3-mini runs
+// on a separate 1g.10gb slice simultaneously, with hardware-enforced isolation.
 type BinPacker struct {
 	registry  *registry.NodeRegistry
 	taskQueue *priorityQueue
@@ -53,76 +69,167 @@ func NewBinPacker(reg *registry.NodeRegistry) *BinPacker {
 	}
 }
 
-// Schedule selects the best GPU node for the given request.
+// expandNode turns one GPUNode into a list of placementCandidates — one per
+// MIG slice for MIG-enabled nodes, or one synthetic candidate for non-MIG nodes.
+// Only slices with free VRAM >= neededMiB are included.
+func (b *BinPacker) expandNode(n *registry.GPUNode, neededMiB int64) []placementCandidate {
+	affHit := n.HasWeights("") // affinity is node-scoped; checked per-request below
+	_ = affHit                 // computed per-slice below using the real model name
+
+	if !n.MIGEnabled || len(n.MIGSlices) == 0 {
+		// Non-MIG: single synthetic candidate representing the whole GPU.
+		syn := n.SyntheticFullSlice()
+		if syn.FreeVRAM() < neededMiB {
+			return nil
+		}
+		return []placementCandidate{{
+			node:   n,
+			slice:  syn,
+			affHit: false, // caller sets this; expandNode doesn't know model name
+		}}
+	}
+
+	var out []placementCandidate
+	for _, s := range n.MIGSlices {
+		if !s.Healthy || s.FreeVRAM() < neededMiB {
+			continue
+		}
+		out = append(out, placementCandidate{node: n, slice: s, affHit: false})
+	}
+	return out
+}
+
+// Schedule needs affinity per-model, so we re-compute it after expansion.
+// Refactored Schedule to pass model name into expansion properly:
+func (b *BinPacker) expandNodeForModel(n *registry.GPUNode, neededMiB int64, modelName string) []placementCandidate {
+	affHit := n.HasWeights(modelName)
+
+	if !n.MIGEnabled || len(n.MIGSlices) == 0 {
+		syn := n.SyntheticFullSlice()
+		if syn.FreeVRAM() < neededMiB {
+			return nil
+		}
+		return []placementCandidate{{node: n, slice: syn, affHit: affHit}}
+	}
+
+	var out []placementCandidate
+	for _, s := range n.MIGSlices {
+		if !s.Healthy || s.FreeVRAM() < neededMiB {
+			continue
+		}
+		out = append(out, placementCandidate{node: n, slice: s, affHit: affHit})
+	}
+	return out
+}
+
+// Schedule selects the best GPU node (and MIG slice, if applicable) for the request.
 //
-// Selection algorithm (in order of priority):
-//  1. Affinity: prefer nodes that already have the model weights on NVMe.
-//     Waiting 2s for a hot-but-busy GPU beats downloading 50GB from S3.
-//  2. Bin-pack: among affinity candidates, choose the node with the LEAST
-//     free VRAM that can still fit the workload (fill GPUs to 100% before
-//     moving on, enabling scale-to-zero on idle nodes).
-//  3. Eviction check: if any candidate node is above the VRAM eviction
-//     threshold, switch to spread mode and pick the node with MOST free VRAM.
+// Selection algorithm:
+//  1. Expand each node into placement candidates — one per MIG slice for MIG
+//     nodes, one synthetic candidate for non-MIG nodes.
+//  2. Filter by free VRAM >= VRAMNeededMiB.
+//  3. Separate affinity hits (NVMe already has model weights) from cold candidates.
+//  4. If any candidate slice exceeds VRAMEvictionThresholdPct, switch to spread
+//     mode (most-free slice); otherwise bin-pack (least-fit slice).
+//  5. Return chosen node + slice as ScheduleDecision.
 func (b *BinPacker) Schedule(req ScheduleRequest) (*ScheduleDecision, error) {
 	nodes := b.registry.All()
 	if len(nodes) == 0 {
 		return nil, errors.New("no healthy GPU nodes in registry")
 	}
 
-	// Filter: only nodes with enough free VRAM.
-	var candidates []*registry.GPUNode
+	var candidates []placementCandidate
 	for _, n := range nodes {
-		if n.FreeVRAM() >= req.VRAMNeededMiB {
-			candidates = append(candidates, n)
+		for _, c := range b.expandNodeForModel(n, req.VRAMNeededMiB, req.ModelName) {
+			candidates = append(candidates, c)
 		}
 	}
 	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no GPU has %d MiB free VRAM for model %s", req.VRAMNeededMiB, req.ModelName)
+		return nil, fmt.Errorf(
+			"no GPU slice has %d MiB free VRAM for model %s",
+			req.VRAMNeededMiB, req.ModelName,
+		)
 	}
 
-	// Check if any candidate is in eviction territory.
-	spreadMode := b.anyAboveThreshold(candidates)
-
-	// Separate affinity hits from cold candidates.
-	var affinityHits, coldNodes []*registry.GPUNode
-	for _, n := range candidates {
-		if n.HasWeights(req.ModelName) {
-			affinityHits = append(affinityHits, n)
+	var affinityHits, cold []placementCandidate
+	for _, c := range candidates {
+		if c.affHit {
+			affinityHits = append(affinityHits, c)
 		} else {
-			coldNodes = append(coldNodes, n)
+			cold = append(cold, c)
 		}
 	}
-
-	// Prefer affinity candidates; fall back to cold nodes.
 	pool := affinityHits
 	if len(pool) == 0 {
-		pool = coldNodes
+		pool = cold
 	}
-	affinityHit := len(affinityHits) > 0
 
-	var chosen *registry.GPUNode
+	spreadMode := b.anySliceAboveThreshold(candidates)
+
+	var chosen *placementCandidate
 	if spreadMode {
-		// Spread: pick the node with the MOST free VRAM to reduce OOM risk.
-		chosen = b.mostFree(pool)
+		chosen = b.mostFreeSlice(pool)
 	} else {
-		// Bin-pack: pick the node with the LEAST free VRAM that still fits,
-		// so we fill GPUs fully and can power down empty nodes.
-		chosen = b.leastFitFree(pool, req.VRAMNeededMiB)
+		chosen = b.leastFitSlice(pool, req.VRAMNeededMiB)
+	}
+	if chosen == nil {
+		return nil, fmt.Errorf("scheduler could not select a slice for model %s", req.ModelName)
 	}
 
-	if chosen == nil {
-		return nil, fmt.Errorf("scheduler could not select a node for model %s", req.ModelName)
+	sliceID := ""
+	if chosen.node.MIGEnabled {
+		sliceID = chosen.slice.SliceID
 	}
 
 	return &ScheduleDecision{
-		NodeID:      chosen.NodeID,
-		GPUID:       chosen.GPUID,
-		AffinityHit: affinityHit,
+		NodeID:      chosen.node.NodeID,
+		GPUID:       chosen.node.GPUID,
+		SliceID:     sliceID,
+		MIGEnabled:  chosen.node.MIGEnabled,
+		AffinityHit: len(affinityHits) > 0,
 	}, nil
 }
 
-// anyAboveThreshold returns true if any node has VRAM usage above the eviction threshold.
-// This is the trigger to switch from bin-pack to spread mode.
+// anySliceAboveThreshold returns true if any candidate slice is over the eviction threshold.
+func (b *BinPacker) anySliceAboveThreshold(candidates []placementCandidate) bool {
+	for _, c := range candidates {
+		if c.slice.VRAMUtilizationPct() > VRAMEvictionThresholdPct {
+			return true
+		}
+	}
+	return false
+}
+
+// leastFitSlice returns the candidate whose slice has the smallest free VRAM
+// that still fits neededMiB (tightest-fit bin-packing).
+func (b *BinPacker) leastFitSlice(candidates []placementCandidate, neededMiB int64) *placementCandidate {
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].slice.FreeVRAM() < candidates[j].slice.FreeVRAM()
+	})
+	for i := range candidates {
+		if candidates[i].slice.FreeVRAM() >= neededMiB {
+			return &candidates[i]
+		}
+	}
+	return nil
+}
+
+// mostFreeSlice returns the candidate whose slice has the most free VRAM (spread mode).
+func (b *BinPacker) mostFreeSlice(candidates []placementCandidate) *placementCandidate {
+	if len(candidates) == 0 {
+		return nil
+	}
+	best := &candidates[0]
+	for i := range candidates[1:] {
+		if candidates[i+1].slice.FreeVRAM() > best.slice.FreeVRAM() {
+			best = &candidates[i+1]
+		}
+	}
+	return best
+}
+
+// anyAboveThreshold returns true if any node-level VRAM utilization is over threshold.
+// Kept for callers that operate at node granularity (e.g. health dashboards).
 func (b *BinPacker) anyAboveThreshold(nodes []*registry.GPUNode) bool {
 	for _, n := range nodes {
 		if n.VRAMUtilizationPct() > VRAMEvictionThresholdPct {
@@ -132,37 +239,7 @@ func (b *BinPacker) anyAboveThreshold(nodes []*registry.GPUNode) bool {
 	return false
 }
 
-// leastFitFree returns the node with the smallest free VRAM that still fits the request.
-// This is the bin-packing "tightest fit" heuristic.
-func (b *BinPacker) leastFitFree(nodes []*registry.GPUNode, neededMiB int64) *registry.GPUNode {
-	sort.Slice(nodes, func(i, j int) bool {
-		return nodes[i].FreeVRAM() < nodes[j].FreeVRAM()
-	})
-	for _, n := range nodes {
-		if n.FreeVRAM() >= neededMiB {
-			return n
-		}
-	}
-	return nil
-}
-
-// mostFree returns the node with the most free VRAM (spread mode).
-func (b *BinPacker) mostFree(nodes []*registry.GPUNode) *registry.GPUNode {
-	if len(nodes) == 0 {
-		return nil
-	}
-	best := nodes[0]
-	for _, n := range nodes[1:] {
-		if n.FreeVRAM() > best.FreeVRAM() {
-			best = n
-		}
-	}
-	return best
-}
-
 // --- Priority Queue for preemption ---
-// When a P0 request arrives and the cluster is full, the scheduler must find
-// the cheapest P1 or P2 task to evict. Go's container/heap is ideal here.
 
 type task struct {
 	ModelName string
@@ -170,6 +247,7 @@ type task struct {
 	VRAMMiB   int64
 	NodeID    string
 	GPUID     string
+	SliceID   string // MIG slice, "" if non-MIG
 	index     int
 }
 
@@ -177,10 +255,8 @@ type priorityQueue []*task
 
 func (pq priorityQueue) Len() int { return len(pq) }
 
-// Lower priority number = higher urgency (P0 beats P1 beats P2).
-// For eviction we want to pop the LOWEST urgency (highest Priority number).
 func (pq priorityQueue) Less(i, j int) bool {
-	return pq[i].Priority > pq[j].Priority // max-heap on priority number
+	return pq[i].Priority > pq[j].Priority
 }
 
 func (pq priorityQueue) Swap(i, j int) {
@@ -204,22 +280,18 @@ func (pq *priorityQueue) Pop() any {
 	return t
 }
 
-// Evict removes the lowest-priority task from the queue to make room for a P0 request.
-// Returns the evicted task so the caller can send a SIGTERM to the Rust agent.
 func (b *BinPacker) Evict() (*task, error) {
 	if b.taskQueue.Len() == 0 {
 		return nil, errors.New("no tasks available to evict")
 	}
 	t := heap.Pop(b.taskQueue).(*task)
 	if t.Priority == P0Production {
-		// Should never happen — re-push and refuse.
 		heap.Push(b.taskQueue, t)
 		return nil, errors.New("cannot evict a P0 production task")
 	}
 	return t, nil
 }
 
-// Enqueue adds a new task to the priority queue.
 func (b *BinPacker) Enqueue(t *task) {
 	heap.Push(b.taskQueue, t)
 }

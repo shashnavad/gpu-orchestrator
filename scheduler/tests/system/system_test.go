@@ -20,7 +20,6 @@ func TestSchedulerToReconcilerEndToEnd(t *testing.T) {
 		ModelWeightAffinity: map[string]int64{"model-z": 4096},
 	})
 
-	// 1) Scheduler decides placement.
 	packer := schedulerpkg.NewBinPacker(reg)
 	decision, err := packer.Schedule(schedulerpkg.ScheduleRequest{
 		ModelName:     "model-z",
@@ -34,17 +33,16 @@ func TestSchedulerToReconcilerEndToEnd(t *testing.T) {
 		t.Fatalf("expected placement on node-a, got %s", decision.NodeID)
 	}
 
-	// 2) Reconciler gets desired state from scheduler and actual state from heartbeat.
 	heartbeats := make(chan reconciler.HeartbeatMsg, 1)
 	actions := make(chan reconciler.ReconcileAction, 8)
 	rec := reconciler.NewReconciler(reg, heartbeats, actions)
-	rec.SetDesired(decision.NodeID, decision.GPUID, []string{"model-z"})
+	// SliceID="" for non-MIG node — SetDesired now requires the slice argument.
+	rec.SetDesired(decision.NodeID, decision.GPUID, decision.SliceID, []string{"model-z"})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go rec.Run(ctx)
 
-	// Heartbeat says model-z is not loaded yet -> reconciler should emit PREWARM.
 	heartbeats <- reconciler.HeartbeatMsg{
 		NodeID:       "node-a",
 		GPUID:        "gpu-0",

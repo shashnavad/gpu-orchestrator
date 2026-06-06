@@ -1,0 +1,57 @@
+services:
+
+  # Go scheduler — single instance, source of desired state.
+  scheduler:
+    build:
+      context: ./scheduler
+      dockerfile: Dockerfile.scheduler
+    ports:
+      - "8888:8080"
+    networks:
+      - gpu-net
+
+  # node-001: MIG-enabled H100, 3x 2g.20gb slices.
+  # Simulates phi-3-mini, llama-3-8b, mistral-7b — one per slice.
+  agent-node-001:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile.agent
+    environment:
+      NODE_ID: node-001
+      GPU_ID: gpu-0
+      MIG_NODE: "true"
+      SCHEDULER_URL: http://scheduler:8080/heartbeat
+      LOADER_URL: http://host.docker.internal:8001
+      LISTEN_ADDR: "0.0.0.0:9090"
+    ports:
+      - "9090:9090"
+    depends_on:
+      - scheduler
+    networks:
+      - gpu-net
+
+  # node-002: plain H100, full 80 GiB, no MIG partitioning.
+  # Simulates llama-3-70b and codellama-13b sharing the whole GPU.
+  # Has model_weight_affinity pre-populated, so the scheduler will prefer
+  # this node for future placements of those models over a cold node.
+  agent-node-002:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile.agent
+    environment:
+      NODE_ID: node-002
+      GPU_ID: gpu-0
+      MIG_NODE: "false"
+      SCHEDULER_URL: http://scheduler:8080/heartbeat
+      LOADER_URL: http://host.docker.internal:8001
+      LISTEN_ADDR: "0.0.0.0:9091"
+    ports:
+      - "9091:9091"
+    depends_on:
+      - scheduler
+    networks:
+      - gpu-net
+
+networks:
+  gpu-net:
+    driver: bridge

@@ -23,3 +23,4 @@ serde_json = "1"
 
 # Randomness for mock VRAM simulation.
 rand = "0.8"
+reqwest = { version = "0.13.4", features = ["json"] }

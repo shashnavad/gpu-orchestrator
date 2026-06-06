@@ -10,45 +10,55 @@ import (
 
 // HeartbeatMsg is the message the Rust agent sends every 500ms.
 // It represents the *actual* state of a GPU as observed by nvidia-smi (or mock).
+//
+// MIG change: MIGEnabled and MIGSlices carry per-slice state from the agent.
+// When MIGEnabled is false, the scheduler treats the node as a single slice.
 type HeartbeatMsg struct {
-	NodeID        string
-	GPUID         string
-	UsedVRAMMiB   int64
-	TotalVRAMMiB  int64
-	LoadedModels  []string
-	NVLinkEnabled bool
-	// ModelWeightAffinity is updated incrementally: agent reports which weights
-	// exist on its local NVMe cache.
-	ModelWeightAffinity map[string]int64
+	NodeID              string             `json:"node_id"`
+	GPUID               string             `json:"gpu_id"`
+	UsedVRAMMiB         int64              `json:"used_vram_mib"`
+	TotalVRAMMiB        int64              `json:"total_vram_mib"`
+	LoadedModels        []string           `json:"loaded_models"`
+	NVLinkEnabled       bool               `json:"nvlink_enabled"`
+	MIGEnabled          bool               `json:"mig_enabled"`
+	MIGSlices           []registry.MIGSlice `json:"mig_slices"`
+	ModelWeightAffinity map[string]int64   `json:"model_weight_affinity"`
 }
 
 // Action is an instruction the reconciler emits when desired ≠ actual state.
 type ActionType string
 
 const (
-	ActionEvict   ActionType = "EVICT"
-	ActionPrewarm ActionType = "PREWARM"
+	ActionEvict    ActionType = "EVICT"
+	ActionPrewarm  ActionType = "PREWARM"
 	ActionMarkDead ActionType = "MARK_DEAD"
 )
 
+// ReconcileAction now carries SliceID so the action dispatcher knows
+// which MIG slice to target when calling the Rust agent.
 type ReconcileAction struct {
 	Type      ActionType
 	NodeID    string
 	GPUID     string
-	ModelName string // relevant for EVICT and PREWARM
+	SliceID   string // "" for non-MIG nodes
+	ModelName string
+}
+
+// desiredSliceState captures what models should be on a given slice.
+type desiredSliceState struct {
+	models []string
 }
 
 // Reconciler is the anti-entropy loop. Every 500ms it compares the
 // Desired State (what the Go scheduler wants) against the Actual State
 // (what the Rust agent's heartbeats report) and emits corrective actions.
-//
-// Design: the reconciler does NOT make scheduling decisions — that is the
-// BinPacker's job. The reconciler only detects and corrects drift.
 type Reconciler struct {
 	registry     *registry.NodeRegistry
 	heartbeats   <-chan HeartbeatMsg
 	actions      chan<- ReconcileAction
-	desiredState map[string][]string // nodeKey → list of model names that should be loaded
+	// desiredState key is "nodeID/gpuID/sliceID".
+	// For non-MIG nodes sliceID is "full".
+	desiredState map[string]desiredSliceState
 	staleTimeout time.Duration
 }
 
@@ -61,22 +71,20 @@ func NewReconciler(
 		registry:     reg,
 		heartbeats:   heartbeats,
 		actions:      actions,
-		desiredState: make(map[string][]string),
-		staleTimeout: 2 * time.Second, // miss 4 heartbeats → node is dead
+		desiredState: make(map[string]desiredSliceState),
+		staleTimeout: 2 * time.Second,
 	}
 }
 
 // SetDesired tells the reconciler what models should be loaded on a given GPU.
-// Called by the scheduler after a placement decision.
-func (r *Reconciler) SetDesired(nodeID, gpuID string, models []string) {
-	r.desiredState[nodeID+"/"+gpuID] = models
+// For non-MIG nodes pass sliceID = "". For MIG slices pass the slice ID from
+// the ScheduleDecision (e.g. "0/0/0").
+func (r *Reconciler) SetDesired(nodeID, gpuID, sliceID string, models []string) {
+	key := sliceKey(nodeID, gpuID, sliceID)
+	r.desiredState[key] = desiredSliceState{models: models}
 }
 
-// Run starts the reconciliation loop. It blocks until ctx is cancelled.
-// It uses a select statement to multiplex three inputs:
-//  1. Incoming heartbeats from Rust agents (updates actual state)
-//  2. A 500ms ticker (triggers the diff loop)
-//  3. Context cancellation (clean shutdown)
+// Run starts the reconciliation loop. Blocks until ctx is cancelled.
 func (r *Reconciler) Run(ctx context.Context) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -85,7 +93,6 @@ func (r *Reconciler) Run(ctx context.Context) {
 
 	for {
 		select {
-
 		case hb, ok := <-r.heartbeats:
 			if !ok {
 				log.Println("[reconciler] heartbeat channel closed, shutting down")
@@ -103,8 +110,7 @@ func (r *Reconciler) Run(ctx context.Context) {
 	}
 }
 
-// applyHeartbeat updates the NodeRegistry with the latest actual state from
-// the Rust agent. This is the "write path" — heartbeats are the ground truth.
+// applyHeartbeat updates the NodeRegistry with actual state from the Rust agent.
 func (r *Reconciler) applyHeartbeat(hb HeartbeatMsg) {
 	node := &registry.GPUNode{
 		NodeID:              hb.NodeID,
@@ -113,20 +119,17 @@ func (r *Reconciler) applyHeartbeat(hb HeartbeatMsg) {
 		TotalVRAMMiB:        hb.TotalVRAMMiB,
 		LoadedModels:        hb.LoadedModels,
 		NVLinkEnabled:       hb.NVLinkEnabled,
+		MIGEnabled:          hb.MIGEnabled,
+		MIGSlices:           hb.MIGSlices,
 		ModelWeightAffinity: hb.ModelWeightAffinity,
 		LastHeartbeat:       time.Now(),
 	}
 	r.registry.Upsert(node)
 }
 
-// reconcile is the diff loop. It runs on every tick and compares:
-//   - Desired state: what the scheduler decided should be loaded
-//   - Actual state: what the Rust agent last reported
-//
-// Divergences produce ReconcileActions sent to the actions channel,
-// which the API server (or a dedicated action handler) executes.
+// reconcile diffs desired vs actual state, emitting corrective actions.
+// For MIG nodes it diffs at slice granularity; for non-MIG nodes at node level.
 func (r *Reconciler) reconcile() {
-	// 1. Check for stale nodes (missed heartbeats → treat as dead).
 	stale := r.registry.StaleNodes(r.staleTimeout)
 	for _, n := range stale {
 		log.Printf("[reconciler] node %s/%s missed heartbeats, marking dead", n.NodeID, n.GPUID)
@@ -138,43 +141,99 @@ func (r *Reconciler) reconcile() {
 		}
 	}
 
-	// 2. Diff desired vs actual for each node.
 	for _, node := range r.registry.All() {
-		key := node.NodeID + "/" + node.GPUID
+		if node.MIGEnabled && len(node.MIGSlices) > 0 {
+			r.reconcileMIGNode(node)
+		} else {
+			r.reconcileNonMIGNode(node)
+		}
+	}
+}
+
+// reconcileMIGNode diffs at slice granularity.
+func (r *Reconciler) reconcileMIGNode(node *registry.GPUNode) {
+	for _, slice := range node.MIGSlices {
+		if !slice.Healthy {
+			continue
+		}
+		key := sliceKey(node.NodeID, node.GPUID, slice.SliceID)
 		desired, hasDesired := r.desiredState[key]
 		if !hasDesired {
 			continue
 		}
 
-		actualSet := toSet(node.LoadedModels)
-		desiredSet := toSet(desired)
+		actualSet := toSet(slice.LoadedModels)
+		desiredSet := toSet(desired.models)
 
-		// Models in desired but not in actual → need to be loaded (PREWARM).
 		for model := range desiredSet {
 			if !actualSet[model] {
-				log.Printf("[reconciler] drift: %s should have %s loaded but doesn't", key, model)
+				log.Printf("[reconciler] drift: %s/%s slice=%s should have %s loaded",
+					node.NodeID, node.GPUID, slice.SliceID, model)
 				r.actions <- ReconcileAction{
 					Type:      ActionPrewarm,
 					NodeID:    node.NodeID,
 					GPUID:     node.GPUID,
+					SliceID:   slice.SliceID,
 					ModelName: model,
 				}
 			}
 		}
-
-		// Models in actual but not in desired → should be evicted.
 		for model := range actualSet {
 			if !desiredSet[model] {
-				log.Printf("[reconciler] drift: %s has %s loaded but shouldn't", key, model)
+				log.Printf("[reconciler] drift: %s/%s slice=%s has unwanted %s",
+					node.NodeID, node.GPUID, slice.SliceID, model)
 				r.actions <- ReconcileAction{
 					Type:      ActionEvict,
 					NodeID:    node.NodeID,
 					GPUID:     node.GPUID,
+					SliceID:   slice.SliceID,
 					ModelName: model,
 				}
 			}
 		}
 	}
+}
+
+// reconcileNonMIGNode is the original node-level diff, unchanged in semantics.
+func (r *Reconciler) reconcileNonMIGNode(node *registry.GPUNode) {
+	key := sliceKey(node.NodeID, node.GPUID, "full")
+	desired, hasDesired := r.desiredState[key]
+	if !hasDesired {
+		return
+	}
+
+	actualSet := toSet(node.LoadedModels)
+	desiredSet := toSet(desired.models)
+
+	for model := range desiredSet {
+		if !actualSet[model] {
+			log.Printf("[reconciler] drift: %s/%s should have %s loaded", node.NodeID, node.GPUID, model)
+			r.actions <- ReconcileAction{
+				Type:      ActionPrewarm,
+				NodeID:    node.NodeID,
+				GPUID:     node.GPUID,
+				ModelName: model,
+			}
+		}
+	}
+	for model := range actualSet {
+		if !desiredSet[model] {
+			log.Printf("[reconciler] drift: %s/%s has unwanted %s", node.NodeID, node.GPUID, model)
+			r.actions <- ReconcileAction{
+				Type:      ActionEvict,
+				NodeID:    node.NodeID,
+				GPUID:     node.GPUID,
+				ModelName: model,
+			}
+		}
+	}
+}
+
+func sliceKey(nodeID, gpuID, sliceID string) string {
+	if sliceID == "" {
+		sliceID = "full"
+	}
+	return nodeID + "/" + gpuID + "/" + sliceID
 }
 
 func toSet(ss []string) map[string]bool {
