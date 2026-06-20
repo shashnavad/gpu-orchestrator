@@ -36,6 +36,7 @@ from typing import Optional
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from paths import HF_CACHE_DIR_DEFAULT
 
 log = logging.getLogger(__name__)
 
@@ -102,7 +103,7 @@ class CheckpointManager:
                 saved_at=time.time(),
                 save_duration_sec=round(time.perf_counter() - t0, 2),
                 weight_file=weight_file,
-                hf_cache_dir=str(os.environ.get("HF_CACHE_DIR", "/mnt/nvme/hf_cache")),
+                hf_cache_dir=str(os.environ.get("HF_CACHE_DIR", HF_CACHE_DIR_DEFAULT)),
             )
             _write_manifest(tmp_dir, manifest)
 

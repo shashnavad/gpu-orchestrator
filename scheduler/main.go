@@ -10,7 +10,9 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
+	"gpu-orchestrator/admission"
 	"gpu-orchestrator/cache"
 	"gpu-orchestrator/reconciler"
 	"gpu-orchestrator/registry"
@@ -26,7 +28,6 @@ func main() {
 	modelCache := cache.NewModelCache()
 	_ = modelCache
 	bpScheduler := schedulerpkg.NewBinPacker(nodeReg)
-	_ = bpScheduler
 
 	heartbeatCh := make(chan reconciler.HeartbeatMsg, 256)
 	actionCh := make(chan reconciler.ReconcileAction, 64)
@@ -35,20 +36,22 @@ func main() {
 
 	rec := reconciler.NewReconciler(nodeReg, heartbeatCh, actionCh)
 	analyzer := traffic.NewTrafficAnalyzer(requestEventCh, prewarmSignalCh)
+	admissionQueue := admission.NewQueue(50) // capacity per WFQ class
+	gateway := admission.NewGateway(bpScheduler, rec, admissionQueue, 5*time.Second)
 
 	go rec.Run(ctx)
 	go analyzer.Run(ctx)
 	go handleActions(ctx, actionCh, prewarmSignalCh)
-	go serveHeartbeats(ctx, heartbeatCh)
+	go gateway.DrainLoop(ctx, 500*time.Millisecond)
+	go serveHeartbeats(ctx, heartbeatCh, gateway)
 
 	log.Println("[main] gpu-orchestrator scheduler running on :8080")
 	<-ctx.Done()
 	log.Println("[main] shutdown complete")
 }
 
-func serveHeartbeats(ctx context.Context, ch chan<- reconciler.HeartbeatMsg) {
+func serveHeartbeats(ctx context.Context, ch chan<- reconciler.HeartbeatMsg, gw *admission.Gateway) {
 	mux := http.NewServeMux()
-
 	mux.HandleFunc("/heartbeat", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -68,6 +71,7 @@ func serveHeartbeats(ctx context.Context, ch chan<- reconciler.HeartbeatMsg) {
 		}
 	})
 
+	mux.HandleFunc("/schedule", gw.HandleSchedule)
 	srv := &http.Server{Addr: ":8080", Handler: mux}
 
 	go func() {

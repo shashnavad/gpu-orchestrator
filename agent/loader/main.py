@@ -35,6 +35,7 @@ from transformers import (
 )
 
 from checkpoint import CheckpointManager
+from paths import HF_CACHE_DIR_DEFAULT, CHECKPOINT_DIR_DEFAULT
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,8 +44,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 LOADER_PORT = int(os.environ.get("LOADER_PORT", "8001"))
-HF_CACHE_DIR = os.environ.get("HF_CACHE_DIR", "/mnt/nvme/hf_cache")
-CHECKPOINT_DIR = os.environ.get("CHECKPOINT_DIR", "/mnt/nvme/checkpoints")
+HF_CACHE_DIR = os.environ.get("HF_CACHE_DIR", HF_CACHE_DIR_DEFAULT)
+CHECKPOINT_DIR = os.environ.get("CHECKPOINT_DIR", CHECKPOINT_DIR_DEFAULT)
 VRAM_HEADROOM_MIB = int(os.environ.get("VRAM_HEADROOM_MIB", "2048"))
 
 

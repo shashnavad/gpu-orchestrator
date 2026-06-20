@@ -3,6 +3,7 @@ package reconciler
 import (
 	"context"
 	"log"
+	"sync"
 	"time"
 
 	"gpu-orchestrator/registry"
@@ -14,15 +15,15 @@ import (
 // MIG change: MIGEnabled and MIGSlices carry per-slice state from the agent.
 // When MIGEnabled is false, the scheduler treats the node as a single slice.
 type HeartbeatMsg struct {
-	NodeID              string             `json:"node_id"`
-	GPUID               string             `json:"gpu_id"`
-	UsedVRAMMiB         int64              `json:"used_vram_mib"`
-	TotalVRAMMiB        int64              `json:"total_vram_mib"`
-	LoadedModels        []string           `json:"loaded_models"`
-	NVLinkEnabled       bool               `json:"nvlink_enabled"`
-	MIGEnabled          bool               `json:"mig_enabled"`
+	NodeID              string              `json:"node_id"`
+	GPUID               string              `json:"gpu_id"`
+	UsedVRAMMiB         int64               `json:"used_vram_mib"`
+	TotalVRAMMiB        int64               `json:"total_vram_mib"`
+	LoadedModels        []string            `json:"loaded_models"`
+	NVLinkEnabled       bool                `json:"nvlink_enabled"`
+	MIGEnabled          bool                `json:"mig_enabled"`
 	MIGSlices           []registry.MIGSlice `json:"mig_slices"`
-	ModelWeightAffinity map[string]int64   `json:"model_weight_affinity"`
+	ModelWeightAffinity map[string]int64    `json:"model_weight_affinity"`
 }
 
 // Action is an instruction the reconciler emits when desired ≠ actual state.
@@ -53,9 +54,10 @@ type desiredSliceState struct {
 // Desired State (what the Go scheduler wants) against the Actual State
 // (what the Rust agent's heartbeats report) and emits corrective actions.
 type Reconciler struct {
-	registry     *registry.NodeRegistry
-	heartbeats   <-chan HeartbeatMsg
-	actions      chan<- ReconcileAction
+	registry   *registry.NodeRegistry
+	heartbeats <-chan HeartbeatMsg
+	actions    chan<- ReconcileAction
+	mu         sync.RWMutex
 	// desiredState key is "nodeID/gpuID/sliceID".
 	// For non-MIG nodes sliceID is "full".
 	desiredState map[string]desiredSliceState
@@ -76,12 +78,64 @@ func NewReconciler(
 	}
 }
 
-// SetDesired tells the reconciler what models should be loaded on a given GPU.
-// For non-MIG nodes pass sliceID = "". For MIG slices pass the slice ID from
-// the ScheduleDecision (e.g. "0/0/0").
+// SetDesired replaces the full desired model list for a node/gpu/slice. This
+// wipes any model not present in `models` — correct for bulk initialization,
+// unsafe for incremental scheduling decisions where another model may already
+// be desired on the same slice. Use AddDesired/RemoveDesired for those.ls []string) {
 func (r *Reconciler) SetDesired(nodeID, gpuID, sliceID string, models []string) {
 	key := sliceKey(nodeID, gpuID, sliceID)
-	r.desiredState[key] = desiredSliceState{models: models}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.desiredState[key] = desiredSliceState{models: append([]string(nil), models...)}
+}
+
+// AddDesired adds modelName to the desired set for a slice without disturbing
+// any other model already desired there. Idempotent.
+func (r *Reconciler) AddDesired(nodeID, gpuID, sliceID, modelName string) {
+	key := sliceKey(nodeID, gpuID, sliceID)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state := r.desiredState[key]
+	for _, m := range state.models {
+		if m == modelName {
+			return
+		}
+	}
+	state.models = append(state.models, modelName)
+	r.desiredState[key] = state
+}
+
+// RemoveDesired removes modelName from the desired set for a slice, leaving
+// any other desired model untouched.
+func (r *Reconciler) RemoveDesired(nodeID, gpuID, sliceID, modelName string) {
+	key := sliceKey(nodeID, gpuID, sliceID)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state, ok := r.desiredState[key]
+	if !ok {
+		return
+	}
+	out := state.models[:0]
+	for _, m := range state.models {
+		if m != modelName {
+			out = append(out, m)
+		}
+	}
+	state.models = out
+	r.desiredState[key] = state
+}
+
+// snapshotDesired returns a copy of the desired model set for a slice,
+// safe to use after the lock is released.
+func (r *Reconciler) snapshotDesired(key string) (map[string]bool, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	state, ok := r.desiredState[key]
+	if !ok {
+		return nil, false
+	}
+	return toSet(state.models), true
 }
 
 // Run starts the reconciliation loop. Blocks until ctx is cancelled.
@@ -157,13 +211,12 @@ func (r *Reconciler) reconcileMIGNode(node *registry.GPUNode) {
 			continue
 		}
 		key := sliceKey(node.NodeID, node.GPUID, slice.SliceID)
-		desired, hasDesired := r.desiredState[key]
+		desiredSet, hasDesired := r.snapshotDesired(key)
 		if !hasDesired {
 			continue
 		}
 
 		actualSet := toSet(slice.LoadedModels)
-		desiredSet := toSet(desired.models)
 
 		for model := range desiredSet {
 			if !actualSet[model] {
@@ -197,13 +250,12 @@ func (r *Reconciler) reconcileMIGNode(node *registry.GPUNode) {
 // reconcileNonMIGNode is the original node-level diff, unchanged in semantics.
 func (r *Reconciler) reconcileNonMIGNode(node *registry.GPUNode) {
 	key := sliceKey(node.NodeID, node.GPUID, "full")
-	desired, hasDesired := r.desiredState[key]
+	desiredSet, hasDesired := r.snapshotDesired(key)
 	if !hasDesired {
 		return
 	}
 
 	actualSet := toSet(node.LoadedModels)
-	desiredSet := toSet(desired.models)
 
 	for model := range desiredSet {
 		if !actualSet[model] {
