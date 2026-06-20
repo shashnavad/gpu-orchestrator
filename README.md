@@ -20,6 +20,9 @@ gpu-orchestrator/
 │   │   └── bin_packer.go
 │   ├── reconciler/
 │   │   └── reconciler.go
+│   ├── admission/
+│   │   ├── gateway.go
+│   │   └── queue.go
 │   ├── cache/
 │   │   └── model_cache.go
 │   └── traffic/
@@ -63,6 +66,11 @@ gpu-orchestrator/
    - Non-MIG nodes use a synthetic full-GPU slice so both code paths share one scheduler implementation.
    - The Python loader enforces per-slice VRAM budgets via `slice_vram_cap_mib` on each `/load` call, failing fast before the OOM killer acts.
    - Hardware isolation is provided by the MIG partition itself; the scheduler and loader add a soft guard layer on top.
+13. **Admission backpressure with weighted fair queueing**:
+   - `POST /schedule` attempts immediate placement via the bin-packer first.
+   - On a capacity miss, the request is queued by priority class (mapped from the existing P0/P1/P2) instead of dropped — a 70/20/10 (High/Medium/Low) weighted round-robin so batch jobs can't starve production traffic out of retries.
+   - The handler long-polls the queued request up to a configurable timeout. A full per-class queue or an expired wait returns `429 Too Many Requests` with `Retry-After`.
+   - A background loop retries queued requests against the live registry on a fixed interval as capacity frees up.
 
 ## Commands to Use and Start
 
@@ -128,6 +136,19 @@ Expected output on the scheduler terminal:
 [gpu] node-002/gpu-0  allotted=81920 MiB  used=49511 MiB  free=32409 MiB  (60%)  models: llama-3-70b, codellama-13b
 ```
 
+### 3c) Test admission backpressure
+
+With the mock cluster running, saturate a node and watch low-priority requests
+queue or get throttled:
+
+```bash
+curl -i -X POST localhost:8888/schedule \
+  -d '{"ModelName":"big-model","VRAMNeededMiB":40000,"Priority":2}'
+```
+
+`200` = placed immediately. `429` = every slice is full and the per-class
+queue is also full — back off per `Retry-After`.
+
 ### 4) Start the Python FastAPI model loader
 
 ```bash
@@ -155,3 +176,4 @@ go test ./tests/unit ./tests/integration ./tests/system
 - Treat the Rust agent as the source of observed node reality.
 - Use reconciliation and prewarm signals to keep latency and cost controlled.
 - On MIG nodes, pass the `SliceID` from `ScheduleDecision` into `SetDesired` so the reconciler diffs at slice granularity, not node level.
+- Use `AddDesired`/`RemoveDesired` for incremental scheduling decisions. `SetDesired` replaces the entire desired list for a slice — fine for bulk/initial state, but it will silently evict any other model already placed on that slice if used per-request.
