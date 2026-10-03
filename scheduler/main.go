@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -41,7 +42,7 @@ func main() {
 
 	go rec.Run(ctx)
 	go analyzer.Run(ctx)
-	go handleActions(ctx, actionCh, prewarmSignalCh)
+	go handleActions(ctx, nodeReg, actionCh, prewarmSignalCh)
 	go gateway.DrainLoop(ctx, 500*time.Millisecond)
 	go serveHeartbeats(ctx, heartbeatCh, gateway)
 
@@ -127,7 +128,26 @@ func logHeartbeat(msg reconciler.HeartbeatMsg) {
 	}
 }
 
-func handleActions(ctx context.Context, actions <-chan reconciler.ReconcileAction, prewarns <-chan traffic.PrewarmSignal) {
+// agentCommandClient is used to dispatch PREWARM/EVICT commands to the Rust
+// agent's /command endpoint. A short timeout keeps one unreachable node from
+// backing up the action loop; dispatch runs in its own goroutine per action
+// anyway (see dispatchToAgent), but a hung request would still pin that
+// goroutine and its connection indefinitely without this.
+var agentCommandClient = &http.Client{Timeout: 5 * time.Second}
+
+// agentCommand mirrors the Rust agent's AgentCommand struct (agent/src/main.rs).
+type agentCommand struct {
+	Action      string `json:"action"`
+	ModelName   string `json:"model_name"`
+	Quantization string `json:"quantization,omitempty"`
+	SliceID     string `json:"slice_id,omitempty"`
+}
+
+// handleActions is where desired state actually becomes real state: it takes
+// what the reconciler decided and dispatches it to the Rust agent that owns
+// the target node, rather than only logging it. Without this, PREWARM/EVICT
+// were purely observational — nothing ever told an agent to call the loader.
+func handleActions(ctx context.Context, nodeReg *registry.NodeRegistry, actions <-chan reconciler.ReconcileAction, prewarns <-chan traffic.PrewarmSignal) {
 	for {
 		select {
 		case action, ok := <-actions:
@@ -137,8 +157,10 @@ func handleActions(ctx context.Context, actions <-chan reconciler.ReconcileActio
 			switch action.Type {
 			case reconciler.ActionEvict:
 				log.Println(formatAction("EVICT", action))
+				dispatchToAgent(nodeReg, action, "EVICT")
 			case reconciler.ActionPrewarm:
 				log.Println(formatAction("PLACED", action))
+				dispatchToAgent(nodeReg, action, "PREWARM")
 			case reconciler.ActionMarkDead:
 				log.Printf("[scheduler] NODE DOWN  %s/%s  -- workloads will be rescheduled", action.NodeID, action.GPUID)
 			}
@@ -151,6 +173,60 @@ func handleActions(ctx context.Context, actions <-chan reconciler.ReconcileActio
 			return
 		}
 	}
+}
+
+// dispatchToAgent sends the actual HTTP command to the node's Rust agent.
+// Runs off the action-processing goroutine so one slow/unreachable agent
+// can't stall reconciliation for every other node.
+//
+// Note: quantization isn't threaded through ScheduleRequest yet (see
+// scheduler/scheduler/bin_packer.go), so every dispatch currently leaves it
+// unset and the loader falls back to whatever quantization the repo itself
+// ships pre-baked (vLLM reads AWQ/GPTQ config straight off the checkpoint).
+// Per-request quantization selection is a reasonable next step, not done here.
+func dispatchToAgent(nodeReg *registry.NodeRegistry, action reconciler.ReconcileAction, verb string) {
+	node, ok := nodeReg.Get(action.NodeID, action.GPUID)
+	if !ok || node.AgentAddr == "" {
+		log.Printf("[dispatch] no known agent address for %s/%s, dropping %s %s",
+			action.NodeID, action.GPUID, verb, action.ModelName)
+		return
+	}
+
+	cmd := agentCommand{
+		Action:    verb,
+		ModelName: action.ModelName,
+		SliceID:   action.SliceID,
+	}
+	body, err := json.Marshal(cmd)
+	if err != nil {
+		log.Printf("[dispatch] failed to encode command for %s: %v", action.ModelName, err)
+		return
+	}
+
+	go func(addr string) {
+		resp, err := agentCommandClient.Post(addr+"/command", "application/json", bytes.NewReader(body))
+		if err != nil {
+			log.Printf("[dispatch] %s %s -> %s failed: %v", verb, action.ModelName, addr, err)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			log.Printf("[dispatch] %s %s -> %s returned %s", verb, action.ModelName, addr, resp.Status)
+			return
+		}
+		// The agent's /command handler always answers 200 and puts the real
+		// outcome in the body (see handle_command in agent/src/main.rs) — a
+		// failed loader call still comes back as HTTP 200 {"status":"error"}.
+		var result struct {
+			Status string `json:"status"`
+			Detail string `json:"detail"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil && result.Status == "error" {
+			log.Printf("[dispatch] %s %s -> %s reported error: %s", verb, action.ModelName, addr, result.Detail)
+			return
+		}
+		log.Printf("[dispatch] %s %s -> %s ok", verb, action.ModelName, addr)
+	}(node.AgentAddr)
 }
 
 // formatAction builds a readable log line for placement and eviction events.

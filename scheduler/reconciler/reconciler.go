@@ -24,6 +24,10 @@ type HeartbeatMsg struct {
 	MIGEnabled          bool                `json:"mig_enabled"`
 	MIGSlices           []registry.MIGSlice `json:"mig_slices"`
 	ModelWeightAffinity map[string]int64    `json:"model_weight_affinity"`
+	// AgentAddr is the Rust agent's own callback address (e.g.
+	// "http://agent-node-001:9090"), so the dispatcher in main.go knows
+	// where to send PREWARM/EVICT commands back for this node.
+	AgentAddr string `json:"agent_addr"`
 }
 
 // Action is an instruction the reconciler emits when desired ≠ actual state.
@@ -176,6 +180,7 @@ func (r *Reconciler) applyHeartbeat(hb HeartbeatMsg) {
 		MIGEnabled:          hb.MIGEnabled,
 		MIGSlices:           hb.MIGSlices,
 		ModelWeightAffinity: hb.ModelWeightAffinity,
+		AgentAddr:           hb.AgentAddr,
 		LastHeartbeat:       time.Now(),
 	}
 	r.registry.Upsert(node)

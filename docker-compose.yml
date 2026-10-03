@@ -23,6 +23,9 @@ services:
       SCHEDULER_URL: http://scheduler:8080/heartbeat
       LOADER_URL: http://host.docker.internal:8001
       LISTEN_ADDR: "0.0.0.0:9090"
+      # How the scheduler dials back into this container to send PREWARM/EVICT
+      # commands — the compose network's DNS name, not LISTEN_ADDR's 0.0.0.0.
+      AGENT_CALLBACK_ADDR: http://agent-node-001:9090
     ports:
       - "9090:9090"
     depends_on:
@@ -45,6 +48,7 @@ services:
       SCHEDULER_URL: http://scheduler:8080/heartbeat
       LOADER_URL: http://host.docker.internal:8001
       LISTEN_ADDR: "0.0.0.0:9091"
+      AGENT_CALLBACK_ADDR: http://agent-node-002:9091
     ports:
       - "9091:9091"
     depends_on:

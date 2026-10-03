@@ -76,6 +76,11 @@ type GPUNode struct {
 	// LoadedModels are models currently resident in GPU memory across all slices.
 	LoadedModels []string
 
+	// AgentAddr is the Rust agent's callback address for this node, reported
+	// on every heartbeat. The action dispatcher in main.go POSTs PREWARM and
+	// EVICT commands here.
+	AgentAddr string
+
 	LastHeartbeat time.Time
 	Healthy       bool
 }

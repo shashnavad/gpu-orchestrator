@@ -1,0 +1,11 @@
+# Core sidecar API
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+anyio==4.7.0
+
+# Real serving backend. Only required when VLLM_MOCK is unset/false —
+# see vllm_engine.py. vLLM pulls in torch itself; don't pin torch
+# separately here or you'll fight vLLM's CUDA build matching.
+vllm==0.6.6
+PYEOF

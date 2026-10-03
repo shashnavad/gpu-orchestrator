@@ -34,6 +34,10 @@ struct HeartbeatPayload {
     mig_enabled: bool,
     mig_slices: Vec<MIGSlice>,
     model_weight_affinity: std::collections::HashMap<String, u64>,
+    // Where the scheduler should send PREWARM/EVICT commands back to reach
+    // this agent's /command endpoint. Without this the reconciler has no way
+    // to find us — it only ever sees this process via inbound heartbeats.
+    agent_addr: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -137,6 +141,17 @@ async fn main() {
     let listen_addr = std::env::var("LISTEN_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:9090".to_string());
 
+    // The address other services (the Go scheduler) should use to reach
+    // this agent's /command endpoint. LISTEN_ADDR is usually 0.0.0.0:PORT,
+    // which isn't dialable from another host/container, so this needs its
+    // own value — the compose file sets it to the service's DNS name
+    // (e.g. http://agent-node-001:9090). Falls back to localhost with
+    // LISTEN_ADDR's port for bare-metal/single-host runs.
+    let agent_addr = std::env::var("AGENT_CALLBACK_ADDR").unwrap_or_else(|_| {
+        let port = listen_addr.rsplit(':').next().unwrap_or("9090");
+        format!("http://localhost:{port}")
+    });
+
     // MIG_NODE=true boots the agent as the MIG-partitioned H100 (node-001).
     // Any other value (or absent) boots as the plain H100 (node-002).
     let mig_node = std::env::var("MIG_NODE").map(|v| v == "true").unwrap_or(false);
@@ -161,6 +176,7 @@ async fn main() {
         mig_enabled,
         mig_slices: initial_slices,
         model_weight_affinity: affinity,
+        agent_addr: agent_addr.clone(),
     };
 
     let state = Arc::new(AgentState {
@@ -178,8 +194,8 @@ async fn main() {
         .with_state(Arc::clone(&state));
 
     println!(
-        "[agent] node={} gpu={} mig={} listening on {}",
-        node_id, gpu_id, mig_enabled, listen_addr
+        "[agent] node={} gpu={} mig={} listening on {} (callback: {})",
+        node_id, gpu_id, mig_enabled, listen_addr, agent_addr
     );
     let listener = tokio::net::TcpListener::bind(&listen_addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -380,21 +396,33 @@ async fn handle_command(
             cmd.slice_id.as_deref(),
             slice_vram_cap,
         ).await {
-            Ok(resp) => Json(serde_json::json!({
-                "status": "ok", "action": "PREWARM",
-                "model": resp.model_name,
-                "vram_used_mib": resp.vram_used_mib,
-                "load_duration_sec": resp.load_duration_sec,
-                "affinity_cache_hit": resp.affinity_cache_hit,
-                "slice_id": slice_info,
-            })),
+            Ok(resp) => {
+                // The loader actually has it loaded now — record that in the
+                // state heartbeat_loop reports, instead of leaving it to the
+                // mock fixture / stale status.loaded snapshot. Without this,
+                // the reconciler's next tick still sees the old "actual"
+                // state and re-issues PREWARM forever (see the comment on
+                // mark_loaded for the full story).
+                mark_loaded(&state, cmd.slice_id.as_deref(), &resp.model_name);
+                Json(serde_json::json!({
+                    "status": "ok", "action": "PREWARM",
+                    "model": resp.model_name,
+                    "vram_used_mib": resp.vram_used_mib,
+                    "load_duration_sec": resp.load_duration_sec,
+                    "affinity_cache_hit": resp.affinity_cache_hit,
+                    "slice_id": slice_info,
+                }))
+            },
             Err(e) => Json(serde_json::json!({ "status": "error", "detail": e })),
         },
         "EVICT" => match call_loader_evict(&state, &cmd.model_name).await {
-            Ok(_) => Json(serde_json::json!({
-                "status": "ok", "action": "EVICT",
-                "model": cmd.model_name, "slice_id": slice_info,
-            })),
+            Ok(_) => {
+                mark_evicted(&state, cmd.slice_id.as_deref(), &cmd.model_name);
+                Json(serde_json::json!({
+                    "status": "ok", "action": "EVICT",
+                    "model": cmd.model_name, "slice_id": slice_info,
+                }))
+            },
             Err(e) => Json(serde_json::json!({ "status": "error", "detail": e })),
         },
         "CHECKPOINT" => match call_loader_checkpoint(&state, &cmd.model_name).await {
@@ -408,6 +436,54 @@ async fn handle_command(
             "status": "error",
             "message": format!("unknown action: {unknown}")
         })),
+    }
+}
+
+/// Record that `model_name` is now loaded, in whichever part of the
+/// heartbeat payload the Go reconciler actually diffs against:
+/// `mig_slices[i].loaded_models` for MIG nodes (reconcileMIGNode reads this
+/// per-slice field, not the flat list below), or the flat `loaded_models`
+/// for non-MIG nodes (reconcileNonMIGNode). Both the mock heartbeat loop and
+/// the real one only mutate the flat list / re-derive from a static fixture,
+/// so without this, a model that was actually just loaded never shows up as
+/// "actual" state and the reconciler re-issues PREWARM on every 500ms tick
+/// indefinitely. The loader call already happened for real (mock or not —
+/// call_loader_load always hits the Python sidecar); this just makes our own
+/// telemetry honest about it.
+fn mark_loaded(state: &Arc<AgentState>, slice_id: Option<&str>, model_name: &str) {
+    let mut p = state.payload.lock().unwrap();
+    match slice_id {
+        Some(sid) => {
+            if let Some(slice) = p.mig_slices.iter_mut().find(|s| s.slice_id == sid) {
+                if !slice.loaded_models.iter().any(|m| m == model_name) {
+                    slice.loaded_models.push(model_name.to_string());
+                }
+            }
+        }
+        None => {
+            if !p.loaded_models.iter().any(|m| m == model_name) {
+                p.loaded_models.push(model_name.to_string());
+            }
+        }
+    }
+}
+
+/// Mirror of mark_loaded for EVICT. Removes model_name from whichever field
+/// the reconciler diffs against for this node, so a slice that no longer
+/// desires a model stops being reported as still having it — otherwise
+/// EVICT gets re-dispatched every tick too (harmlessly, since the loader
+/// no-ops on an already-evicted model, but it never stops).
+fn mark_evicted(state: &Arc<AgentState>, slice_id: Option<&str>, model_name: &str) {
+    let mut p = state.payload.lock().unwrap();
+    match slice_id {
+        Some(sid) => {
+            if let Some(slice) = p.mig_slices.iter_mut().find(|s| s.slice_id == sid) {
+                slice.loaded_models.retain(|m| m != model_name);
+            }
+        }
+        None => {
+            p.loaded_models.retain(|m| m != model_name);
+        }
     }
 }
 

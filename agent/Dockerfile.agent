@@ -1,13 +1,20 @@
-FROM rust:1.86-slim-bookworm AS builder
+FROM rust:1.90-slim-bookworm AS builder
 WORKDIR /app
-COPY Cargo.toml .
+# Cargo.lock pinned and copied in (not just Cargo.toml): without it, every
+# build re-resolves dependencies fresh against whatever's newest on
+# crates.io, and reqwest's transitive deps (url -> idna -> idna_adapter ->
+# icu_*) have been bumping their MSRV fast enough that a build pinned to a
+# fixed rust: base image eventually can't compile what it resolves to.
+# --locked makes that failure loud and immediate (version drift) instead of
+# a confusing rustc-version error deep in an unrelated crate.
+COPY Cargo.toml Cargo.lock ./
 # Pre-fetch dependencies before copying source (layer cache).
 RUN mkdir src && echo 'fn main(){}' > src/main.rs && \
-    cargo build --features mock --release && \
+    cargo build --features mock --release --locked && \
     rm src/main.rs
 COPY src ./src
 # Touch main.rs so cargo rebuilds it rather than using the dummy above.
-RUN touch src/main.rs && cargo build --features mock --release
+RUN touch src/main.rs && cargo build --features mock --release --locked
 
 FROM debian:bookworm-slim
 WORKDIR /app
